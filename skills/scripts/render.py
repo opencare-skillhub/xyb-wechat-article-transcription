@@ -108,6 +108,37 @@ DEFAULT_FOOTER = textwrap.dedent(
     """
 )
 
+CAREGIVER_STAGE_MODULE = textwrap.dedent(
+    """
+    <section style="display:flex;align-items:center;margin:28px 30px 15px;">
+      <span style="display:inline-block;width:4px;height:20px;background-color:__MAIN__;border-radius:2px;margin-right:10px;"></span>
+      <strong style="font-size:16px;color:__MAIN__;">小胰宝补充：家属也需要被照顾</strong>
+    </section>
+
+    <section style="font-family:'PingFangSC-light','PingFang SC',sans-serif;font-size:14px;padding:0 20px;letter-spacing:1px;line-height:2;text-align:justify;margin:15px 0;">
+      <p style="margin:0 0 10px;">肿瘤治疗不只考验患者，也会持续消耗家属。参考国际心理肿瘤学、癌症照护者支持和姑息照护共识，家属可以按疾病阶段给自己设定更现实的心理任务。</p>
+      <p style="margin:0 0 8px;"><strong style="color:__MAIN__;">早期：把慌乱变成可执行计划</strong></p>
+      <p style="margin:0 0 6px;">① 先确认诊断、分期、治疗路径和复诊时间，避免在信息混乱中反复自责。</p>
+      <p style="margin:0 0 6px;">② 每次就诊前列出3个最重要问题，帮助患者把注意力放回可控事项。</p>
+      <p style="margin:0 0 6px;">③ 鼓励患者参与决定，但不要把所有选择压力都推给患者一个人。</p>
+      <p style="margin:0 0 6px;">④ 保持家庭日常节律，包括睡眠、饮食、工作和陪诊分工。</p>
+      <p style="margin:0 0 10px;">⑤ 如果持续失眠、惊恐、反复查资料停不下来，家属也应主动寻求心理支持。</p>
+      <p style="margin:0 0 8px;"><strong style="color:__MAIN__;">中期：把陪伴变成长期协作</strong></p>
+      <p style="margin:0 0 6px;">① 治疗反复时，家属要从“必须立刻解决”调整为“稳定陪伴和及时沟通”。</p>
+      <p style="margin:0 0 6px;">② 记录症状、药物反应和情绪变化，帮助医生判断下一步，而不是独自硬扛。</p>
+      <p style="margin:0 0 6px;">③ 接受患者情绪波动，不急着讲道理，也不把沉默等同于放弃。</p>
+      <p style="margin:0 0 6px;">④ 安排替班照护，避免一个家属长期高压导致照护耗竭。</p>
+      <p style="margin:0 0 10px;">⑤ 当家庭沟通频繁冲突时，可以请求心理、社工或安宁疗护团队协助。</p>
+      <p style="margin:0 0 8px;"><strong style="color:__MAIN__;">晚期/末期：把目标转向舒适和尊严</strong></p>
+      <p style="margin:0 0 6px;">① 和医疗团队讨论疼痛、营养、呼吸、睡眠和焦虑等症状控制目标。</p>
+      <p style="margin:0 0 6px;">② 尽早了解患者真正看重的事：想见谁、怕什么、希望怎样被照顾。</p>
+      <p style="margin:0 0 6px;">③ 家属不必把“继续治疗”作为唯一爱的表达，减轻痛苦同样是积极照护。</p>
+      <p style="margin:0 0 6px;">④ 允许悲伤、愤怒和无力感出现，必要时寻求哀伤辅导或家庭会议支持。</p>
+      <p style="margin:0 0 10px;">⑤ 若出现自伤念头、极度绝望、严重失眠、惊恐发作或无法照护，请立即联系专业人员或急诊资源。</p>
+    </section>
+    """
+)
+
 
 def call_mcp(tool_name: str, arguments: Dict) -> Dict:
     payload = {"jsonrpc": "2.0", "method": "tools/call", "id": 1, "params": {"name": tool_name, "arguments": arguments}}
@@ -351,13 +382,28 @@ def rewrite_article(title: str, body: str, rewrite_req: str, mode: str = "preset
             intro_html, body_html, summary = sanitize_wechat_html(body)
         else:
             intro_html, body_html, summary = restructure_wechat_html(body)
+        if should_add_caregiver_module(rewrite_req):
+            body_html = append_extra_module(body_html, CAREGIVER_STAGE_MODULE)
         return {"intro": intro_html, "body": body_html, "summary": summary}
 
     paragraphs = split_paragraphs(body)
     summary = make_summary(paragraphs)
     intro_html = "\n".join(f'<p style="margin:0 0 10px;">{escape(p)}</p>' for p in paragraphs[:3])
     body_html = "\n".join(render_paragraph(p) for p in paragraphs[3:])
+    if should_add_caregiver_module(rewrite_req):
+        body_html = append_extra_module(body_html, CAREGIVER_STAGE_MODULE)
     return {"intro": intro_html, "body": body_html, "summary": summary}
+
+
+def should_add_caregiver_module(rewrite_req: str) -> bool:
+    keywords = ["家属", "照护者", "陪护", "早期", "中期", "末期", "晚期", "心理提示"]
+    return any(keyword in rewrite_req for keyword in keywords)
+
+
+def append_extra_module(body_html: str, module_html: str) -> str:
+    if "小胰宝补充：家属也需要被照顾" in body_html:
+        return body_html
+    return "\n".join(part for part in [body_html.strip(), module_html.strip()] if part)
 
 
 def restructure_wechat_html(raw_html: str) -> Tuple[str, str, str]:
