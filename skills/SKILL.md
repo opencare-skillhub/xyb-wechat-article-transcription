@@ -19,7 +19,7 @@ If the input is a WeChat URL, download the article first with the bundled downlo
 
 1. Detect whether the input is a URL or a local file path.
 2. If URL, download HTML and MD via the remote MCP downloader.
-3. Read the source content and extract the article title, summary, and body.
+3. Read the source content and extract the article title, summary, and body from the full `js_content` DOM.
 4. Ask for template family if not already specified. Default to `template1`.
 5. Ask for color style if not already specified. Default to `morandi_purple`.
 6. If the user wants raw original article element retention, use template style 3; otherwise use the preset template elements.
@@ -77,6 +77,14 @@ USP cover subtitle rule:
 Template selection rule:
 - `template1` and `template2` should use preset template elements, not the original article's section structure
 - `template3` is the only mode that preserves the original article element structure and only applies xyb color/output conventions
+
+Body boundary rule:
+- Use subtractive cleanup when the original WeChat `js_content` is available.
+- Preserve the article body from the title/content start, including non-ad inline images and tables.
+- Stop the body at the first tail-operation marker and drop that node plus everything after it.
+- Tail markers include recommendation blocks, online-visit guide blocks, account promotion blocks, author/editor bylines, and tiny decorative boundary images that introduce footer content.
+- For the Fudan Cancer Hospital template family, the tiny image URL containing `O4S31l7wCFJqWpeLPjziaibleMm4WF2WPjUSIN3yXNyMsdrTQFuxEy7mDpNJVLtAcXRnJicc1wJlXHd21XLrr0E1RUnPsCfV8KNwtuPYqmiaBnA` is a hard footer boundary; remove it and all following content.
+- Do not keep tail text such as `在线就诊指南`, `近期热文`, `有爱不惧癌`, `撰文：`, or `编辑：`.
 
 ## Output
 

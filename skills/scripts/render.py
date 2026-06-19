@@ -21,6 +21,33 @@ TEMPLATE_DIR_2 = SKILL_DIR / "assets" / "template2"
 TEMPLATE_DIR_3 = SKILL_DIR / "assets" / "template3"
 DEFAULT_OUTPUT_DIR = Path.home() / "Downloads" / "wechat-monitor" / "output"
 USP_SEPARATOR = "·"
+TAIL_IMAGE_BOUNDARY_FRAGMENTS = [
+    "O4S31l7wCFJqWpeLPjziaibleMm4WF2WPjUSIN3yXNyMsdrTQFuxEy7mDpNJVLtAcXRnJicc1wJlXHd21XLrr0E1RUnPsCfV8KNwtuPYqmiaBnA",
+]
+TAIL_TEXT_MARKERS = [
+    "在线就诊指南",
+    "近期热文",
+    "有爱不惧癌",
+    "点击上方告诉我们您的抗癌故事",
+    "点击专家名片预约门诊",
+    "喜欢此内容的人还喜欢",
+]
+TAIL_PREFIX_PATTERNS = [
+    r"^撰文[:：]",
+    r"^编辑[:：]",
+    r"^责编[:：]",
+    r"^审核[:：]",
+    r"^来源[:：]",
+]
+SECTION_HEADING_PATTERNS = [
+    r"^.+[？?]$",
+    r"^什么是.+",
+    r"^哪些.+",
+    r"^为什么.+",
+    r"^如何.+",
+    r"^第[一二三四五六七八九十]+[部分章节]",
+    r"^[一二三四五六七八九十]+[、.．]\s*.+",
+]
 
 TEMPLATES = {
     ("template1", "morandi_purple"): TEMPLATE_DIR_1 / "xyb_template_morandi_purple.html",
@@ -57,12 +84,8 @@ DEFAULT_FOOTER = textwrap.dedent(
       <p style="margin:0;">小X宝社区志愿者们完成公益贡献<strong>8个癌种+1个罕见病</strong>的AI助手，欢迎有共同价值观的公益病友群发起人联系，推动40+癌种/200+罕见病/慢性病患者应用早日普及。</p>
     </section>
 
-    <section style="text-align:center;margin:25px 20px 15px;">
-      <img src="https://mmbiz.qpic.cn/mmbiz_jpg/1qperl0JnD1AhzWq7ibcKBsg70ppkibibHbNMCWDZqCBxLQ9UdIQdBCNK6VTXWQm8oicQKKfjJnx9d0YJefkOibraLw/640?wx_fmt=jpeg&from=appmsg&tp=webp&wxfrom=5&wx_lazy=1" alt="小胰宝社区" style="width:100%;border-radius:8px;">
-    </section>
-
     <section style="text-align:center;margin:15px 30px 10px;font-size:12px;color:#8d949f;line-height:2;">
-      <p style="font-size:13px;color:__MAIN__;font-weight:600;margin-bottom:6px;">📱 关注我们</p>
+      <p style="font-size:13px;color:__MAIN__;font-weight:600;margin-bottom:6px;">关注我们</p>
       <p style="margin:0;">小红书 @小胰宝宝 ｜ 公众号 @小胰宝助手</p>
       <p style="margin:0;">播客·小宇宙 @微光成炬 胰路同心</p>
       <p style="margin:0;">官网：www.xiaoyibao.com.cn</p>
@@ -161,10 +184,11 @@ def find_title(raw_html: str) -> str | None:
 
 
 def extract_wechat_body_html(raw_html: str) -> str:
-    m = re.search(r'<div[^>]+id=["\']js_content["\'][^>]*>(.*?)</div>', raw_html, re.I | re.S)
-    if not m:
+    soup = BeautifulSoup(raw_html, "html.parser")
+    root = soup.find(id="js_content")
+    if root is None:
         return ""
-    return m.group(1)
+    return "".join(str(child) for child in root.children)
 
 
 def html_to_text(raw_html: str) -> str:
@@ -346,13 +370,19 @@ def restructure_wechat_html(raw_html: str) -> Tuple[str, str, str]:
             continue
         if not isinstance(node, Tag):
             continue
-        rendered, plain = render_node(node)
+        rendered, plain, should_stop = render_node(node, "__MAIN__", trim_leading_media=True)
         if not rendered:
+            if should_stop:
+                break
             continue
         if len(summary_parts) < 3 and plain:
             summary_parts.append(plain)
         blocks.append(rendered)
+        if should_stop:
+            break
 
+    blocks = drop_leading_media_blocks(blocks)
+    blocks = [block for block in blocks if not is_empty_html_block(block)]
     intro = "\n".join(blocks[:4])
     body = "\n".join(blocks[4:])
     summary = " ".join(summary_parts)[:220]
@@ -371,8 +401,11 @@ def render_paragraph(paragraph: str) -> str:
 def sanitize_wechat_html(raw_html: str) -> Tuple[str, str, str]:
     soup = BeautifulSoup(raw_html, "html.parser")
     root = soup
+    truncate_tail(root)
     clean_wechat_dom(root)
     blocks, summary_parts = collect_clean_blocks(root)
+    blocks = drop_leading_media_blocks(blocks)
+    blocks = [block for block in blocks if not is_empty_html_block(block)]
     intro = "\n".join(blocks[:4])
     body = "\n".join(blocks[4:])
     summary = " ".join(summary_parts)[:220]
@@ -380,6 +413,7 @@ def sanitize_wechat_html(raw_html: str) -> Tuple[str, str, str]:
 
 
 def clean_wechat_dom(root: Tag) -> None:
+    truncate_tail(root)
     for tag in list(root.find_all(True)):
         if not isinstance(tag, Tag) or not getattr(tag, "name", None):
             continue
@@ -432,6 +466,63 @@ def should_drop_tag(tag: Tag) -> bool:
     return any(re.search(pattern, text) for pattern in noise_patterns)
 
 
+def truncate_tail(root: Tag) -> None:
+    for tag in list(root.find_all(True)):
+        if not isinstance(tag, Tag) or not getattr(tag, "name", None):
+            continue
+        if is_tail_boundary(tag):
+            remove_from_boundary(tag)
+            break
+
+
+def is_tail_boundary(tag: Tag) -> bool:
+    if is_tail_boundary_image(tag):
+        return True
+    text = normalize_paragraph(tag.get_text(" ", strip=True))
+    if not text:
+        return False
+    compact = re.sub(r"\s+", "", text)
+    if len(compact) > 40:
+        return False
+    if compact in TAIL_TEXT_MARKERS:
+        return True
+    if any(marker in compact for marker in TAIL_TEXT_MARKERS) and len(compact) <= 30:
+        return True
+    return any(re.search(pattern, compact) for pattern in TAIL_PREFIX_PATTERNS)
+
+
+def is_tail_boundary_image(tag: Tag) -> bool:
+    images = [tag] if tag.name and tag.name.lower() == "img" else list(tag.find_all("img"))
+    for img in images:
+        src = first_non_empty_attr(img, ["src", "data-src", "data-original", "data-actualsrc", "data-backsrc"])
+        if any(fragment in src for fragment in TAIL_IMAGE_BOUNDARY_FRAGMENTS):
+            if tag is img:
+                return True
+            text = normalize_paragraph(tag.get_text(" ", strip=True))
+            return not text
+    return False
+
+
+def remove_from_boundary(tag: Tag) -> None:
+    boundary = find_removable_boundary(tag)
+    for sibling in list(boundary.find_next_siblings()):
+        sibling.decompose()
+    boundary.decompose()
+
+
+def find_removable_boundary(tag: Tag) -> Tag:
+    current = tag
+    while isinstance(current.parent, Tag):
+        parent = current.parent
+        if parent.name and parent.name.lower() in {"[document]", "body", "html"}:
+            break
+        if parent.find_previous_sibling() or parent.find_next_sibling():
+            current = parent
+            continue
+        break
+    return current
+
+
 def clean_tag_attrs(tag: Tag) -> None:
     allowed = {"href", "src", "data-src", "data-original", "data-actualsrc", "data-backsrc", "style", "colspan", "rowspan"}
     for attr in list(tag.attrs):
@@ -470,30 +561,92 @@ def collect_clean_blocks(root: Tag) -> Tuple[List[str], List[str]]:
     return blocks, summary_parts
 
 
-def render_node(node: Tag) -> Tuple[str, str]:
+def drop_leading_media_blocks(blocks: List[str]) -> List[str]:
+    trimmed = list(blocks)
+    while trimmed and is_media_only_html(trimmed[0]):
+        trimmed.pop(0)
+    return trimmed
+
+
+def is_media_only_html(html: str) -> bool:
+    soup = BeautifulSoup(html, "html.parser")
+    text = normalize_paragraph(soup.get_text(" ", strip=True))
+    if text:
+        return False
+    return bool(soup.find("img"))
+
+
+def is_empty_html_block(html: str) -> bool:
+    soup = BeautifulSoup(html, "html.parser")
+    text = normalize_paragraph(soup.get_text(" ", strip=True))
+    return not text and not soup.find("img") and not soup.find("table")
+
+
+def trim_leading_media_fragment(html: str) -> str:
+    soup = BeautifulSoup(f"<root>{html}</root>", "html.parser")
+    root = soup.find("root")
+    if not root:
+        return html
+    trim_leading_media_nodes(root)
+    return "".join(str(child) for child in root.children).strip()
+
+
+def trim_leading_media_nodes(container: Tag) -> None:
+    for child in list(container.children):
+        if isinstance(child, NavigableString):
+            if normalize_paragraph(str(child)):
+                return
+            child.extract()
+            continue
+        if not isinstance(child, Tag):
+            continue
+        if is_empty_tag(child) or is_media_only_tag(child):
+            child.decompose()
+            continue
+        if not direct_text(child):
+            trim_leading_media_nodes(child)
+            if is_empty_tag(child) or is_media_only_tag(child):
+                child.decompose()
+                continue
+        return
+
+
+def is_empty_tag(tag: Tag) -> bool:
+    text = normalize_paragraph(tag.get_text(" ", strip=True))
+    return not text and not tag.find("img") and not tag.find("table")
+
+
+def is_media_only_tag(tag: Tag) -> bool:
+    text = normalize_paragraph(tag.get_text(" ", strip=True))
+    return not text and bool(tag.find("img")) and not tag.find("table")
+
+
+def direct_text(tag: Tag) -> str:
+    parts = [str(child) for child in tag.children if isinstance(child, NavigableString)]
+    return normalize_paragraph(" ".join(parts))
+
+
+def render_node(node: Tag, main_color: str = "__MAIN__", trim_leading_media: bool = False) -> Tuple[str, str, bool]:
     name = node.name.lower()
     plain = normalize_paragraph(node.get_text(" ", strip=True))
 
-    if name in {"h1", "h2", "h3"}:
+    if is_tail_boundary(node):
+        return "", "", True
+
+    if name in {"h1", "h2", "h3"} or is_section_heading(node, plain):
         if not plain:
-            return "", ""
-        html = (
-            '<section style="display:flex;align-items:center;margin:28px 30px 15px;">'
-            '<span style="display:inline-block;width:4px;height:20px;background-color:#5c4a7a;border-radius:2px;margin-right:10px;"></span>'
-            f'<strong style="font-size:16px;color:#5c4a7a;">{escape(plain)}</strong>'
-            '</section>'
-        )
-        return html, plain
+            return "", "", False
+        return render_module_heading(plain, main_color), plain, False
 
     if name == "p":
         if not plain:
-            return "", ""
-        return f'<p style="margin:0 0 10px;">{render_inline(node)}</p>', plain
+            return "", "", False
+        return f'<p style="margin:0 0 10px;">{render_inline(node)}</p>', plain, False
 
     if name in {"figure", "img"}:
         img = node if name == "img" else node.find("img")
         if not img:
-            return "", ""
+            return "", "", False
         src = first_non_empty_attr(
             img,
             [
@@ -505,39 +658,73 @@ def render_node(node: Tag) -> Tuple[str, str]:
             ],
         )
         if not src:
-            return "", ""
+            return "", "", False
         html = (
             '<section style="text-align:center;margin:20px 20px 15px;">'
             f'<img src="{escape(src, quote=True)}" alt="" style="width:100%;border-radius:8px;">'
             '</section>'
         )
-        return html, ""
+        return html, "", False
 
     if name == "table":
-        return render_table(node), plain
+        return render_table(node), plain, False
 
     if name in {"section", "div"}:
         rendered_children = []
         child_texts = []
+        should_stop = False
         for child in node.children:
             if isinstance(child, NavigableString):
                 continue
             if not isinstance(child, Tag):
                 continue
-            child_html, child_plain = render_node(child)
+            child_html, child_plain, child_stop = render_node(child, main_color)
             if child_html:
                 rendered_children.append(child_html)
             if child_plain:
                 child_texts.append(child_plain)
+            if child_stop:
+                should_stop = True
+                break
+        rendered_children = [part for part in rendered_children if not is_empty_html_block(part)]
+        if trim_leading_media:
+            rendered_children = drop_leading_media_blocks(rendered_children)
         rendered_html = "\n".join(part for part in rendered_children if part).strip()
+        if trim_leading_media and rendered_html:
+            rendered_html = trim_leading_media_fragment(rendered_html)
         child_text = " ".join(part for part in child_texts if part).strip()
         if rendered_html:
-            return rendered_html, child_text
+            return rendered_html, child_text, should_stop
         if plain:
-            return "", plain
-        return "", ""
+            return "", plain, should_stop
+        return "", "", should_stop
 
-    return "", plain
+    return "", plain, False
+
+
+def is_section_heading(node: Tag, plain: str) -> bool:
+    if not plain:
+        return False
+    if len(plain) > 34:
+        return False
+    if node.name.lower() not in {"p", "section", "div"}:
+        return False
+    if node.find("img") or node.find("table"):
+        return False
+    if node.name.lower() in {"section", "div"} and len([child for child in node.find_all(["p", "section", "div"], recursive=False)]) > 1:
+        return False
+    if node.find(["strong", "b"]):
+        return True
+    return any(re.search(pattern, plain) for pattern in SECTION_HEADING_PATTERNS)
+
+
+def render_module_heading(text: str, main_color: str) -> str:
+    return (
+        '<section style="display:flex;align-items:center;margin:28px 30px 15px;">'
+        f'<span style="display:inline-block;width:4px;height:20px;background-color:{main_color};border-radius:2px;margin-right:10px;"></span>'
+        f'<strong style="font-size:16px;color:{main_color};">{escape(text)}</strong>'
+        '</section>'
+    )
 
 
 def first_non_empty_attr(node: Tag, attr_names: List[str]) -> str:
@@ -563,7 +750,7 @@ def render_inline(node: Tag) -> str:
         if child.name.lower() in {"strong", "b"}:
             text = normalize_paragraph(child.get_text(" ", strip=True))
             if text:
-                parts.append(f'<strong style="color:#5c4a7a;">{escape(text)}</strong>')
+                parts.append(f'<strong style="color:__MAIN__;">{escape(text)}</strong>')
         elif child.name.lower() == "br":
             parts.append("<br>")
         else:
@@ -634,7 +821,19 @@ def render(template_path: Path, title: str, title_line: str, rewrite_html: Dict[
     html = html.replace("__ACCENT__", meta["accent"])
     html = html.replace("__BG__", meta["bg"])
     html = html.replace("__XYB_FOOTER__", DEFAULT_FOOTER.replace("__MAIN__", meta["main"]))
-    return html
+    return remove_empty_sections(html)
+
+
+def remove_empty_sections(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    changed = True
+    while changed:
+        changed = False
+        for tag in list(soup.find_all("section")):
+            if is_empty_tag(tag):
+                tag.decompose()
+                changed = True
+    return str(soup)
 
 
 def choose_template(family: str, style: str) -> Path:
