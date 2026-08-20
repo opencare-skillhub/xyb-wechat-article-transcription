@@ -13,13 +13,18 @@ from typing import Dict, List, Tuple
 import requests
 from bs4 import BeautifulSoup, NavigableString, Tag
 
+try:
+    import markdown as markdown_lib
+except Exception:  # pragma: no cover - optional dependency fallback
+    markdown_lib = None
+
 MCP_URL = "https://changfengbox.top/api/mcp"
 TIMEOUT = 120
 SKILL_DIR = Path(__file__).resolve().parent.parent
 TEMPLATE_DIR_1 = SKILL_DIR / "assets" / "template1"
 TEMPLATE_DIR_2 = SKILL_DIR / "assets" / "template2"
 TEMPLATE_DIR_3 = SKILL_DIR / "assets" / "template3"
-DEFAULT_OUTPUT_DIR = Path.home() / "Downloads" / "wechat-monitor" / "output"
+DEFAULT_OUTPUT_DIR = Path.home() / "Downloads"
 USP_SEPARATOR = "·"
 TAIL_IMAGE_BOUNDARY_FRAGMENTS = [
     "O4S31l7wCFJqWpeLPjziaibleMm4WF2WPjUSIN3yXNyMsdrTQFuxEy7mDpNJVLtAcXRnJicc1wJlXHd21XLrr0E1RUnPsCfV8KNwtuPYqmiaBnA",
@@ -108,6 +113,16 @@ DEFAULT_FOOTER = textwrap.dedent(
     """
 )
 
+PARAGRAPH_GROUP_SIZE = 2
+DECORATIVE_SEPARATOR_HTML = (
+    '<div style="display:flex;align-items:center;justify-content:center;gap:8px;margin:16px 0 18px;">'
+    '<span style="width:28px;height:1px;background:linear-gradient(90deg, rgba(74,106,90,0), rgba(74,106,90,.35));"></span>'
+    '<span style="font-size:13px;line-height:1;color:#6a8a7a;">✿</span>'
+    '<span style="width:28px;height:1px;background:linear-gradient(90deg, rgba(74,106,90,.35), rgba(74,106,90,0));"></span>'
+    '</div>'
+)
+LOGO_IMAGE_URL = "https://picgo-1302991947.cos.ap-guangzhou.myqcloud.com/images/Pop%20Mart%20Character%20Front%20View%20(2).png"
+
 CAREGIVER_STAGE_MODULE = textwrap.dedent(
     """
     <section style="display:flex;align-items:center;margin:28px 30px 15px;">
@@ -179,17 +194,91 @@ def download_article(url: str, output_dir: Path) -> Path:
     raise RuntimeError("failed to download article via MCP")
 
 
-def read_source(path: Path) -> Tuple[str, str]:
+def read_source(path: Path) -> Tuple[str, str, Dict[str, str]]:
     raw = path.read_text(encoding="utf-8", errors="ignore")
+    source_info = extract_source_info(raw)
     if path.suffix.lower() in {".html", ".htm"}:
         title = find_title(raw) or clean_generated_title(path.stem)
         body = extract_wechat_body_html(raw)
         if not body.strip():
             body = html_to_text(raw)
+        source_info["source_kind"] = "wechat_html"
+    elif looks_like_jina_markdown(raw):
+        title, body, jina_info = extract_jina_markdown_source(raw)
+        source_info.update(jina_info)
+        source_info["source_kind"] = "jina_markdown"
     else:
         title = clean_generated_title(path.stem)
-        body = raw
-    return title, body
+        body = strip_source_footer(raw)
+        source_info["source_kind"] = "plain_markdown"
+    return title, body, source_info
+
+
+def extract_source_info(raw_text: str) -> Dict[str, str]:
+    info = {"title": "", "author": "", "url": "", "published_time": ""}
+    jina_info = extract_jina_metadata(raw_text)
+    info.update({key: value for key, value in jina_info.items() if value})
+    if any(info.get(key) for key in ("title", "url", "published_time")):
+        return info
+
+    _, tail = split_source_footer(raw_text)
+    if tail:
+        info["title"] = tail[0]
+    if len(tail) >= 2 and not tail[1].startswith("http"):
+        info["author"] = re.sub(r"^作者[:：]\s*", "", tail[1]).strip()
+    if len(tail) >= 3 and tail[2].startswith("http"):
+        info["url"] = tail[2]
+    elif len(tail) >= 2 and tail[1].startswith("http"):
+        info["url"] = tail[1]
+    return info
+
+
+def looks_like_jina_markdown(raw_text: str) -> bool:
+    return "Markdown Content:" in raw_text and "Title:" in raw_text
+
+
+def extract_jina_metadata(raw_text: str) -> Dict[str, str]:
+    info = {"title": "", "url": "", "published_time": "", "author": ""}
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if line.startswith("Title:"):
+            info["title"] = line.split("Title:", 1)[1].strip()
+        elif line.startswith("URL Source:"):
+            info["url"] = line.split("URL Source:", 1)[1].strip()
+        elif line.startswith("Published Time:"):
+            info["published_time"] = line.split("Published Time:", 1)[1].strip()
+    return info
+
+
+def extract_jina_markdown_source(raw_text: str) -> Tuple[str, str, Dict[str, str]]:
+    info = extract_jina_metadata(raw_text)
+    marker = "Markdown Content:"
+    idx = raw_text.find(marker)
+    if idx == -1:
+        return info.get("title") or clean_generated_title("markdown"), raw_text, info
+    body = raw_text[idx + len(marker) :].lstrip("\n\r ")
+    body = re.sub(r"(?m)^\* \* \*$", "---", body)
+    body = body.strip()
+    return info.get("title") or clean_generated_title("markdown"), body, info
+
+
+def split_source_footer(raw_text: str) -> Tuple[str, List[str]]:
+    lines = raw_text.splitlines()
+    source_idx = None
+    for idx in range(len(lines) - 1, -1, -1):
+        if lines[idx].strip() == "source:":
+            source_idx = idx
+            break
+    if source_idx is None:
+        return raw_text, []
+    body = "\n".join(lines[:source_idx]).rstrip()
+    tail = [line.strip() for line in lines[source_idx + 1 :] if line.strip()]
+    return body, tail
+
+
+def strip_source_footer(raw_text: str) -> str:
+    body, _ = split_source_footer(raw_text)
+    return body
 
 
 def get_template_mode(family: str, style: str) -> str:
@@ -386,13 +475,295 @@ def rewrite_article(title: str, body: str, rewrite_req: str, mode: str = "preset
             body_html = append_extra_module(body_html, CAREGIVER_STAGE_MODULE)
         return {"intro": intro_html, "body": body_html, "summary": summary}
 
-    paragraphs = split_paragraphs(body)
-    summary = make_summary(paragraphs)
-    intro_html = "\n".join(f'<p style="margin:0 0 10px;">{escape(p)}</p>' for p in paragraphs[:3])
-    body_html = "\n".join(render_paragraph(p) for p in paragraphs[3:])
+    rendered_blocks, summary = render_text_blocks(body)
+    intro_html = "\n".join(rendered_blocks[:3])
+    body_html = "\n".join(rendered_blocks[3:])
     if should_add_caregiver_module(rewrite_req):
         body_html = append_extra_module(body_html, CAREGIVER_STAGE_MODULE)
     return {"intro": intro_html, "body": body_html, "summary": summary}
+
+
+def render_markdown_document(title: str, body: str) -> Dict[str, str]:
+    normalized = body.strip()
+    if not normalized:
+        return {"intro": "", "body": "", "summary": ""}
+
+    if markdown_lib is not None:
+        try:
+            html_body = markdown_lib.markdown(
+                normalized,
+                extensions=["tables", "fenced_code", "sane_lists", "toc", "attr_list", "nl2br"],
+            )
+        except Exception:
+            html_body = fallback_markdown_html(normalized)
+    else:
+        html_body = fallback_markdown_html(normalized)
+
+    summary = summarize_markdown_body(title, html_body)
+    return {"intro": "", "body": html_body, "summary": summary}
+
+
+def fallback_markdown_html(text: str) -> str:
+    lines = text.splitlines()
+    blocks: List[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped == "---":
+            blocks.append("<hr>")
+        elif stripped.startswith("#"):
+            level = len(stripped) - len(stripped.lstrip("#"))
+            content = stripped[level:].strip()
+            blocks.append(f"<h{min(level, 6)}>{escape(content)}</h{min(level, 6)}>")
+        elif re.match(r"^\s*[-*+]\s+", stripped):
+            item = re.sub(r"^\s*[-*+]\s+", "", stripped)
+            blocks.append(f"<li>{escape(item)}</li>")
+        else:
+            blocks.append(f"<p>{escape(stripped)}</p>")
+    return "\n".join(blocks)
+
+
+def summarize_markdown_body(title: str, html_body: str) -> str:
+    soup = BeautifulSoup(html_body, "html.parser")
+    parts: List[str] = []
+    for node in soup.find_all(["h1", "h2", "h3", "p", "li"], limit=4):
+        text = normalize_paragraph(node.get_text(" ", strip=True))
+        if text:
+            parts.append(text)
+        if len(parts) >= 2:
+            break
+    if parts:
+        return " ".join(parts)[:220]
+    return clean_generated_title(title)[:220]
+
+
+def render_text_blocks(body: str) -> Tuple[List[str], str]:
+    blocks = split_raw_blocks(body)
+    rendered_blocks: List[str] = []
+    summary_parts: List[str] = []
+    rendered_count = 0
+    for block in blocks:
+        rendered = render_text_block(block)
+        if rendered:
+            rendered_blocks.append(rendered)
+            rendered_count += 1
+            if rendered_count % PARAGRAPH_GROUP_SIZE == 0:
+                rendered_blocks.append(DECORATIVE_SEPARATOR_HTML)
+        if len(summary_parts) < 2:
+            plain = normalize_paragraph(block)
+            if plain:
+                summary_parts.append(plain)
+    if rendered_blocks and rendered_blocks[-1] == DECORATIVE_SEPARATOR_HTML:
+        rendered_blocks.pop()
+    summary = " ".join(summary_parts)[:220] if summary_parts else make_summary(blocks)
+    return rendered_blocks, summary
+
+
+def split_raw_blocks(body: str) -> List[str]:
+    parts = [part.strip("\n") for part in re.split(r"\n\s*\n", body)]
+    parts = [part for part in parts if part.strip()]
+    if not parts and body.strip():
+        parts = [line.strip("\n") for line in body.splitlines() if line.strip()]
+    return parts
+
+
+def render_text_block(block: str) -> str:
+    lines = [line for line in block.splitlines() if line.strip()]
+    if not lines:
+        return ""
+
+    if any("\t" in line for line in lines):
+        table_rows = [line.split("\t") for line in lines if "\t" in line]
+        return render_table_rows(table_rows)
+
+    if all(is_bullet_line(line) for line in lines):
+        return render_bullet_list([strip_bullet_prefix(line) for line in lines])
+
+    if len(lines) == 1 and looks_like_section_title(lines[0]):
+        return render_section_heading(lines[0])
+
+    if is_numbered_marker_line(lines[0]):
+        heading = strip_numbered_prefix(lines[0])
+        rendered_parts = [render_section_heading(heading)]
+        remainder = lines[1:]
+        if remainder:
+            rendered_parts.append(render_block_lines(remainder))
+        return "\n".join(part for part in rendered_parts if part)
+
+    if is_structured_text_block(lines):
+        return render_markdown_block("\n".join(lines))
+
+    return render_block_lines(lines)
+
+
+def render_block_lines(lines: List[str]) -> str:
+    paragraphs = split_paragraph_units(lines)
+    rendered_parts: List[str] = []
+    for paragraph in paragraphs:
+        if not paragraph:
+            continue
+        if is_bullet_line(paragraph):
+            rendered_parts.append(render_bullet_list([strip_bullet_prefix(paragraph)]))
+            continue
+        if is_numbered_marker_line(paragraph):
+            rendered_parts.append(render_section_heading(strip_numbered_prefix(paragraph)))
+            continue
+        rendered_parts.append(render_text_paragraph(paragraph))
+    return "\n".join(part for part in rendered_parts if part)
+
+
+def render_markdown_block(text_block: str) -> str:
+    text_block = text_block.strip()
+    if not text_block:
+        return ""
+    if markdown_lib is not None:
+        try:
+            return markdown_lib.markdown(text_block, extensions=["tables", "fenced_code", "sane_lists"])
+        except Exception:
+            pass
+    return "\n".join(
+        f'<p style="margin:0 0 10px;">{escape(normalize_paragraph(line))}</p>'
+        for line in text_block.splitlines()
+        if normalize_paragraph(line)
+    )
+
+
+def render_text_paragraph(text: str) -> str:
+    text = normalize_paragraph(text)
+    if not text:
+        return ""
+    if looks_like_section_title(text):
+        return render_section_heading(text)
+    return f'<p style="margin:0 0 12px;">{escape(text)}</p>'
+
+
+def is_structured_text_block(lines: List[str]) -> bool:
+    for line in lines:
+        text = normalize_paragraph(line)
+        if not text:
+            continue
+        if is_bullet_line(text) or is_numbered_marker_line(text):
+            return True
+        if text.startswith("#"):
+            return True
+    return False
+
+
+def looks_like_section_title(text: str) -> bool:
+    if not text:
+        return False
+    if is_numbered_marker_line(text):
+        return True
+    if len(text) <= 60 and any(re.search(pattern, text) for pattern in SECTION_HEADING_PATTERNS):
+        return True
+    if len(text) <= 60 and re.search(r"[：:]", text):
+        head = re.split(r"[：:]", text, maxsplit=1)[0].strip()
+        if 4 <= len(head) <= 28:
+            return True
+    return False
+
+
+def split_paragraph_units(lines: List[str]) -> List[str]:
+    units: List[str] = []
+    for line in lines:
+        text = normalize_paragraph(line)
+        if not text:
+            continue
+        if is_bullet_line(text) or is_numbered_marker_line(text):
+            units.append(text)
+            continue
+        if looks_like_section_title(text) and len(text) <= 60:
+            units.append(text)
+            continue
+        units.extend(split_sentence_groups(text))
+    return [unit for unit in units if unit]
+
+
+def split_sentence_groups(text: str) -> List[str]:
+    text = normalize_paragraph(text)
+    if not text:
+        return []
+    sentences = [part.strip() for part in re.split(r"(?<=[。！？!?；;])", text) if part.strip()]
+    if not sentences:
+        return [text]
+    groups: List[str] = []
+    buf = ""
+    for sentence in sentences:
+        if not buf:
+            buf = sentence
+            continue
+        if len(buf) <= 80 and len(sentence) <= 80:
+            groups.append(buf)
+            buf = sentence
+        else:
+            groups.append(buf)
+            buf = sentence
+    if buf:
+        groups.append(buf)
+    return groups
+
+
+def render_section_heading(text: str) -> str:
+    text = normalize_paragraph(text)
+    if not text:
+        return ""
+    if is_numbered_marker_line(text):
+        text = strip_numbered_prefix(text)
+    return (
+        '<div style="display:flex;align-items:center;gap:10px;margin:18px 0 12px;">'
+        '<span style="width:10px;height:10px;border-radius:50%;background:linear-gradient(135deg,#176B52,#67CFA7);flex:0 0 auto;"></span>'
+        f'<h2 style="margin:0;font-size:20px;line-height:1.4;color:#4a6a5a;">{escape(text)}</h2>'
+        '</div>'
+    )
+
+
+def render_bullet_list(items: List[str]) -> str:
+    clean_items = [strip_bullet_prefix(item) for item in items if normalize_paragraph(item)]
+    if not clean_items:
+        return ""
+    lis = "".join(f'<li style="margin:0 0 8px;">{escape(item)}</li>' for item in clean_items)
+    return (
+        '<ul style="margin:0 0 12px 18px;padding:0;">'
+        f"{lis}"
+        '</ul>'
+    )
+
+
+def is_bullet_line(text: str) -> bool:
+    return bool(re.match(r"^\s*[-*•]\s+", text))
+
+
+def strip_bullet_prefix(text: str) -> str:
+    return re.sub(r"^\s*[-*•]\s+", "", normalize_paragraph(text)).strip()
+
+
+def is_numbered_marker_line(text: str) -> bool:
+    return bool(re.match(r"^\s*\d+\.\s+", text))
+
+
+def strip_numbered_prefix(text: str) -> str:
+    return re.sub(r"^\s*\d+\.\s+", "", normalize_paragraph(text)).strip()
+
+
+def render_decorative_separator() -> str:
+    return DECORATIVE_SEPARATOR_HTML
+
+
+def render_table_rows(rows: List[List[str]]) -> str:
+    if not rows:
+        return ""
+    width = max(len(row) for row in rows)
+    rows = [row + [""] * (width - len(row)) for row in rows]
+    html_rows = ['<table class="data-table">', "<thead>", "<tr>"]
+    html_rows.extend(f"<th>{escape(cell.strip())}</th>" for cell in rows[0])
+    html_rows.extend(["</tr>", "</thead>", "<tbody>"])
+    for row in rows[1:]:
+        html_rows.append("<tr>")
+        html_rows.extend(f"<td>{escape(cell.strip())}</td>" for cell in row)
+        html_rows.append("</tr>")
+    html_rows.extend(["</tbody>", "</table>"])
+    return "\n".join(html_rows)
 
 
 def should_add_caregiver_module(rewrite_req: str) -> bool:
@@ -851,23 +1222,128 @@ def clean_generated_title(title: str) -> str:
     return title
 
 
-def render(template_path: Path, title: str, title_line: str, rewrite_html: Dict[str, str], family: str, style: str) -> str:
+def render(template_path: Path, title: str, rewrite_html: Dict[str, str], family: str, style: str, source_info: Dict[str, str]) -> str:
     meta = COLOR_META[family][style]
-    usp = make_usp(title, rewrite_html["summary"])
     template = template_path.read_text(encoding="utf-8")
-    html = template
-    html = html.replace("__TITLE__", escape(title))
-    html = html.replace("__SUBTITLE__", escape(usp))
-    html = html.replace("__META__", title_line)
-    html = html.replace("__TITLE_LINE__", escape(title_line))
-    html = html.replace("__SUMMARY__", escape(rewrite_html["summary"]))
-    html = html.replace("__INTRO__", rewrite_html["intro"])
-    html = html.replace("__BODY__", rewrite_html["body"])
-    html = html.replace("__MAIN__", meta["main"])
-    html = html.replace("__ACCENT__", meta["accent"])
-    html = html.replace("__BG__", meta["bg"])
-    html = html.replace("__XYB_FOOTER__", DEFAULT_FOOTER.replace("__MAIN__", meta["main"]))
-    return remove_empty_sections(html)
+    if any(token in template for token in ["__TITLE__", "__SUBTITLE__", "__INTRO__", "__BODY__", "__SUMMARY__", "__XYB_FOOTER__"]):
+        title_line = f"{family} · {style}"
+        usp = make_usp(title, rewrite_html["summary"])
+        html = template
+        html = html.replace("__TITLE__", escape(title))
+        html = html.replace("__SUBTITLE__", escape(usp))
+        html = html.replace("__META__", title_line)
+        html = html.replace("__TITLE_LINE__", escape(title_line))
+        html = html.replace("__SUMMARY__", escape(rewrite_html["summary"]))
+        html = html.replace("__INTRO__", rewrite_html["intro"])
+        html = html.replace("__BODY__", rewrite_html["body"])
+        html = html.replace("__MAIN__", meta["main"])
+        html = html.replace("__ACCENT__", meta["accent"])
+        html = html.replace("__BG__", meta["bg"])
+        html = html.replace("__XYB_FOOTER__", DEFAULT_FOOTER.replace("__MAIN__", meta["main"]))
+        return remove_empty_sections(html)
+    return build_generated_html(title, rewrite_html, family, style, source_info)
+
+
+def build_generated_html(title: str, rewrite_html: Dict[str, str], family: str, style: str, source_info: Dict[str, str]) -> str:
+    meta = COLOR_META[family][style]
+    summary = rewrite_html["summary"]
+    body_html = "\n".join(part for part in [rewrite_html["intro"], rewrite_html["body"]] if part.strip())
+    footer_html = DEFAULT_FOOTER.replace("__MAIN__", meta["main"])
+    footer_author = source_info.get("author", "")
+    footer_url = source_info.get("url", "")
+    footer_title = source_info.get("title", "") or title
+    style_label = {
+        "morandi_purple": "紫色",
+        "morandi_green": "绿色",
+        "raw_original": "原文",
+    }.get(style, style)
+    return textwrap.dedent(
+        f"""
+        <!doctype html>
+        <html lang="zh-CN">
+        <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>{escape(title)}</title>
+          <meta name="description" content="{escape(summary)}">
+          <style>
+            :root {{
+              --bg: {meta["bg"]};
+              --surface: #ffffff;
+              --main: {meta["main"]};
+              --accent: {meta["accent"]};
+              --text: #3e3e3e;
+              --muted: #8d949f;
+              --line: #dce8e1;
+              --soft: #e9f7f1;
+            }}
+            body {{ margin: 0; background: var(--bg); color: var(--text); font-family: 'PingFang SC','PingFangSC-light',-apple-system,BlinkMacSystemFont,'Helvetica Neue','Microsoft YaHei',sans-serif; line-height: 1.8; letter-spacing: 0.5px; }}
+            .page {{ max-width: 920px; margin: 0 auto; padding: 0 0 28px; }}
+            .hero {{ background: linear-gradient(135deg, var(--main), var(--accent)); color: #fff; text-align: center; padding: 28px 20px 24px; box-shadow: 0 8px 30px rgba(74,106,90,.12); }}
+            .hero .logo-wrap {{ width: 84px; height: 84px; margin: 0 auto; padding: 4px; border-radius: 50%; background: rgba(255,255,255,.18); box-shadow: inset 0 0 0 1px rgba(255,255,255,.18); }}
+            .hero img {{ width: 84px; height: 84px; border-radius: 50%; object-fit: cover; display: inline-block; background: #fff; }}
+            .hero .brand {{ margin: 12px 0 6px; font-size: 16px; font-weight: 600; letter-spacing: 2px; }}
+            .hero .subtitle {{ margin: 0; font-size: 12px; opacity: .88; letter-spacing: 2px; }}
+            .title-card {{ margin: 14px 16px 0; background: var(--surface); border-radius: 18px; padding: 24px 18px; box-shadow: 0 4px 18px rgba(74,106,90,.08); }}
+            .title-tag {{ display: inline-block; background: var(--soft); color: {meta["main"]}; padding: 5px 14px; border-radius: 999px; font-size: 12px; letter-spacing: 1px; }}
+            h1 {{ margin: 16px 0 10px; font-size: 28px; line-height: 1.35; color: {meta["main"]}; letter-spacing: 0; }}
+            .summary {{ margin: 0; color: #5e6a66; font-size: 14px; line-height: 1.9; }}
+            .meta {{ margin-top: 12px; color: var(--muted); font-size: 12px; line-height: 1.7; }}
+            .content {{ margin: 16px 16px 0; background: var(--surface); border-radius: 18px; padding: 18px 18px 8px; box-shadow: 0 4px 18px rgba(74,106,90,.06); }}
+            .content p {{ margin: 0 0 12px; font-size: 14px; line-height: 1.95; text-align: justify; }}
+            .content h1, .content h2, .content h3 {{ margin: 26px 0 14px; color: var(--main); font-size: 20px; line-height: 1.4; }}
+            .content h4, .content h5, .content h6 {{ margin: 22px 0 12px; color: var(--main); font-size: 16px; line-height: 1.4; }}
+            .content ul, .content ol {{ margin: 0 0 14px 20px; padding: 0; }}
+            .content li {{ margin: 0 0 8px; }}
+            .content blockquote {{ margin: 0 0 14px; padding: 12px 14px; border-left: 3px solid var(--accent); background: rgba(122,170,144,0.08); color: #5b6762; }}
+            .content hr {{ border: 0; border-top: 1px solid var(--line); margin: 18px 0; }}
+            .content table {{ width: 100%; border-collapse: collapse; margin: 0 0 16px; font-size: 13px; line-height: 1.65; }}
+            .content thead {{ background: #eaf4ee; }}
+            .content th, .content td {{ border: 1px solid var(--line); padding: 9px 10px; text-align: left; vertical-align: top; }}
+            .content th {{ color: var(--main); font-weight: 600; }}
+            .content img {{ max-width: 100%; height: auto; border-radius: 10px; display: block; margin: 10px auto; }}
+            .content strong {{ color: var(--main); }}
+            .footer {{ margin: 16px 16px 0; background: var(--surface); border-radius: 18px; padding: 18px; box-shadow: 0 4px 18px rgba(74,106,90,.06); }}
+            .footer-title {{ margin: 0 0 8px; font-size: 16px; color: var(--main); font-weight: 700; }}
+            .footer p {{ margin: 0 0 8px; font-size: 12px; line-height: 1.8; color: #6d7774; word-break: break-all; }}
+            .badge {{ display: inline-block; padding: 4px 10px; border-radius: 999px; background: rgba(74,106,90,.08); color: var(--main); font-size: 12px; }}
+          </style>
+        </head>
+        <body>
+          <div class="page">
+            <section class="hero">
+              <div class="logo-wrap">
+                <img src="{LOGO_IMAGE_URL}" alt="小胰宝"/>
+              </div>
+              <p class="brand">小胰宝 · 科普前沿</p>
+              <p class="subtitle">AI+人文 · 全心全意为患者</p>
+            </section>
+
+            <section class="title-card">
+              <span class="title-tag">{escape(style_label)}模板 · 原文保留</span>
+              <h1>{escape(title)}</h1>
+              <p class="summary">{escape(summary)}</p>
+              <div class="meta">
+                <div><span class="badge">原文引用报告信息</span></div>
+                {f'<div>来源：{escape(footer_title)}</div>' if footer_title else ''}
+                {f'<div>发布时间：{escape(source_info.get("published_time", ""))}</div>' if source_info.get("published_time") else ''}
+                {f'<div>作者：{escape(footer_author)}</div>' if footer_author else ''}
+                {f'<div>链接：{escape(footer_url)}</div>' if footer_url else ''}
+              </div>
+            </section>
+
+            <section class="content">
+              {body_html}
+            </section>
+
+            <section class="footer">
+              {footer_html}
+            </section>
+          </div>
+        </body>
+        </html>
+        """
+    ).strip()
 
 
 def remove_empty_sections(html: str) -> str:
@@ -930,17 +1406,24 @@ def main() -> int:
             raise FileNotFoundError(f"input file not found: {args.source}")
         source_path = path
 
-    title, body = read_source(source_path)
+    title, body, source_info = read_source(source_path)
     mode = get_template_mode(family, style)
-    rewrite_html = rewrite_article(title, body, rewrite_req, mode)
+    if source_info.get("source_kind") == "jina_markdown":
+        rewrite_html = render_markdown_document(title, body)
+    else:
+        rewrite_html = rewrite_article(title, body, rewrite_req, mode)
     template_path = choose_template(family, style)
-    title_line = f"xyb-wechat-transcribe | {family} | {style}"
-    html = render(template_path, title, title_line, rewrite_html, family, style)
+    html = render(template_path, title, rewrite_html, family, style, source_info)
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     safe_title = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff_-]+", "_", title).strip("_") or "xyb_article"
-    out_path = out_dir / f"{safe_title}_公众号_{style}.html"
+    style_label = {
+        "morandi_purple": "紫色",
+        "morandi_green": "绿色",
+        "raw_original": "原文",
+    }.get(style, style)
+    out_path = out_dir / f"{safe_title}_公众号_{style_label}.html"
     out_path.write_text(html, encoding="utf-8")
     print(str(out_path.resolve()))
     return 0

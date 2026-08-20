@@ -26,7 +26,16 @@ If the input is a WeChat URL, download the article first with the bundled downlo
 6. Ask for rewrite requirements if not already specified, including the desired tone or extra emphasis.
 7. Rewrite the article for公众号 readability while preserving factual data.
 8. Render the article into the chosen xyb template.
-9. Save the HTML and return the absolute file path for review.
+9. Save the HTML under `~/Downloads/公众号转写结果/` by default and return the absolute file path for review.
+
+## Priority rules
+
+- Treat template assets as stable skeletons and style references.
+- Do not edit template assets during ordinary transcribe/render runs.
+- Rebuild a new HTML from content plus the selected skeleton/elements; do not keep patching templates for each article.
+- Only repair a template asset when a real structural defect is confirmed and reproducible.
+- If the skeleton is valid, keep it unchanged and regenerate the output HTML from content.
+- Final output filenames must not contain `模版` or `模板`.
 
 ## Template selection
 
@@ -63,6 +72,14 @@ Allowed rewrite actions:
 - reorganize long paragraphs into sections
 - add brief explanation around technical terms
 - keep key medical terms bold
+- split long text into short paragraphs or numbered blocks
+
+Formatting requirements:
+- prefer section titles, short paragraphs, and numbered lists for dense technical content
+- keep each rendered paragraph within about 2-3 lines on mobile when possible, and generally no more than 5 lines
+- avoid dumping one idea into a single long block when it can be split without changing meaning
+- use blank lines, decorative dividers, or small icon separators between paragraph groups when helpful
+- preserve and elevate markdown markers from the source text, especially `1.`/`2.` section numbers and `-` bullet lists, instead of flattening them into plain paragraphs
 
 Do not invent new data or claims.
 
